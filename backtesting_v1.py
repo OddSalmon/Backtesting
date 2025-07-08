@@ -104,26 +104,9 @@ def plot_interactive_chart(data_df, trades, show_trades=False):
     fig.update_layout(title='Интерактивный график цены и сделок', xaxis_rangeslider_visible=True, template='plotly_dark')
     return fig
 
-# --- ИЗМЕНЕНИЕ: Расширенный список монет ---
 PRESETS = {
-    "okx": {
-        "Spot": {
-            "BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT", "SOL/USDT": "SOL-USDT",
-            "LTC/USDT": "LTC-USDT", "XRP/USDT": "XRP-USDT", "DOGE/USDT": "DOGE-USDT"
-        },
-        "Futures": {
-            "BTC/USDT": "BTC-USDT-SWAP", "ETH/USDT": "ETH-USDT-SWAP", "SOL/USDT": "SOL-USDT-SWAP",
-            "LTC/USDT":"LTC-USDT-SWAP", "XRP/USDT": "XRP-USDT-SWAP", "LINK/USDT": "LINK-USDT-SWAP"
-        }
-    },
-    "bitmex": {
-        # У BitMEX нет традиционного спота в CCXT, поэтому список пуст
-        "Spot": {},
-        "Futures": {
-            "XBT/USDT": "XBTUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT",
-            "LINK/USDT": "LINKUSDT", "XRP/USDT": "XRPUSDT"
-        }
-    }
+    "okx": {"Spot": {"BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT"}, "Futures": {"BTC/USDT": "BTC-USDT-SWAP"}},
+    "bitmex": {"Futures": {"XBT/USDT": "XBTUSDT"}}
 }
 
 # --- 3. Интерфейс Streamlit ---
@@ -137,11 +120,7 @@ with st.sidebar:
     instrument = st.selectbox("Инструмент", list(PRESETS[exchange].keys()))
     
     available_pairs = list(PRESETS[exchange][instrument].keys()) if instrument in PRESETS[exchange] else []
-    if not available_pairs:
-        symbol_display = st.text_input("Торговая пара (тикер CCXT)", "BTC-USDT-SWAP")
-    else:
-        symbol_display = st.selectbox("Торговая пара", available_pairs)
-    
+    symbol_display = st.selectbox("Торговая пара", available_pairs) if available_pairs else st.text_input("Торговая пара (тикер CCXT)", "BTC-USDT-SWAP")
     symbol_ccxt = PRESETS.get(exchange, {}).get(instrument, {}).get(symbol_display, symbol_display)
 
     timeframe = st.selectbox("Таймфрейм", ['1d', '4h', '1h'])
@@ -180,22 +159,23 @@ if st.sidebar.button("🚀 Запустить бэктест"):
         
         cerebro = bt.Cerebro()
         cerebro.adddata(bt.feeds.PandasData(dataname=data_df))
-        strategy_params = {
-            'initial_order_size': initial_order_size, 'safety_order_size': safety_order_size,
-            'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent,
-            'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent,
-            'direction': direction, 'is_futures': is_futures, 'leverage': leverage
-        }
-        results = cerebro.addstrategy(DcaGridStrategy, **strategy_params)
+        strategy_params = {'initial_order_size': initial_order_size, 'safety_order_size': safety_order_size, 'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent, 'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent, 'direction': direction, 'is_futures': is_futures, 'leverage': leverage}
+        
+        # Просто регистрируем стратегию
+        cerebro.addstrategy(DcaGridStrategy, **strategy_params)
         
         cerebro.broker.set_cash(initial_cash)
         cerebro.broker.setcommission(commission=commission if use_commission else 0.0, leverage=leverage if is_futures and use_leverage else 1)
         
         log_container = st.expander("Показать/скрыть лог сделок", expanded=False)
         start_value = cerebro.broker.getvalue()
-        cerebro.run()
+
+        # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+        # Теперь мы сохраняем результат выполнения cerebro.run()
+        results = cerebro.run()
         end_value = cerebro.broker.getvalue()
 
+        # И теперь можем безопасно получить доступ к результатам
         if results[0].liquidated:
             st.markdown("""
             <div style="background-color: #FF4B4B; padding: 20px; border-radius: 10px; text-align: center;">
@@ -211,5 +191,6 @@ if st.sidebar.button("🚀 Запустить бэктест"):
 
         st.subheader("Интерактивный график")
         show_trades_on_chart = st.checkbox("Показать все сделки на графике", value=False)
+        # И здесь тоже используем правильную переменную results
         fig = plot_interactive_chart(data_df, results[0].trades, show_trades=show_trades_on_chart)
         st.plotly_chart(fig, use_container_width=True)
