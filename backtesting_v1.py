@@ -12,81 +12,71 @@ import pandas as pd
 import ccxt
 import backtrader as bt
 from datetime import datetime, timezone
-import matplotlib
+import plotly.graph_objects as go
 
-# ИСПРАВЛЕНИЕ 1: Решаем проблему с графиком в серверной среде
-matplotlib.use('Agg')
-
-# --- 1. Класс Стратегии для Backtrader (с логикой для фьючерсов) ---
+# --- 1. Класс Стратегии (с исправлениями) ---
 class DcaGridStrategy(bt.Strategy):
     params = (
-        # Параметры стратегии
-        ('initial_order_size', 100.0),
-        ('safety_order_size', 100.0),
-        ('price_step_percent', 2.0),
-        ('price_step_multiplier', 1.5),
-        ('safety_orders_count', 10),
-        ('take_profit_percent', 2.0),
-        # Параметры фьючерсов
-        ('is_futures', False),
-        ('leverage', 1),
-        ('funding_rate', 0.0001), # Средняя ставка финансирования 0.01%
+        ('initial_order_size', 100.0), ('safety_order_size', 100.0),
+        ('price_step_percent', 2.0), ('price_step_multiplier', 1.5),
+        ('safety_orders_count', 10), ('take_profit_percent', 2.0),
+        ('is_futures', False), ('leverage', 1), ('funding_rate', 0.0001),
     )
 
     def __init__(self):
-        self.entry_price = 0
-        self.total_cost = 0
-        self.total_size = 0
-        self.take_profit_price = 0
-        self.liquidation_price = 0
+        self.entry_price = 0; self.total_cost = 0; self.total_size = 0
+        self.take_profit_price = 0; self.liquidation_price = 0
         self.safety_orders_placed = 0
-        # Таймер для списания funding'а каждые 8 часов
+        self.trades = []
+        # ИСПРАВЛЕНИЕ 2: Состояние для отслеживания ликвидации
+        self.liquidated = False
+
         if self.p.is_futures:
-            self.add_timer(
-                when=bt.Timer.SESSION_START,
-                offset=bt.timedelta(hours=8),
-                repeat=bt.timedelta(hours=8)
-            )
+            self.add_timer(when=bt.Timer.SESSION_START, offset=bt.timedelta(hours=8), repeat=bt.timedelta(hours=8))
 
     def notify_timer(self, timer, when, *args):
-        # Списываем комиссию за финансирование
         funding_fee = self.broker.get_value() * self.p.funding_rate
         self.broker.add_cash(-funding_fee)
-        self.log(f'FUNDING FEE: -${funding_fee:.2f} charged.')
 
     def notify_order(self, order):
-        if order.status in [order.Completed]:
+        if order.status == order.Completed:
+            trade_info = {
+                'dt': bt.num2date(order.executed.dt),
+                'price': order.executed.price,
+                'size': order.executed.size
+            }
             if order.isbuy():
-                self.log(f'BUY EXECUTED: Size {order.executed.size:.4f}, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}')
                 self.total_cost += order.executed.value
                 self.total_size += order.executed.size
                 self.entry_price = self.total_cost / self.total_size
                 self.take_profit_price = self.entry_price * (1 + self.p.take_profit_percent / 100)
-                # Рассчитываем цену ликвидации (упрощенно)
                 if self.p.is_futures:
-                    self.liquidation_price = self.entry_price * (1 - (1 / self.p.leverage))
+                    self.liquidation_price = self.entry_price * (1 - (0.99 / self.p.leverage))
+                trade_info['type'] = 'buy'
+                self.trades.append(trade_info)
             elif order.issell():
-                self.log(f'SELL EXECUTED: Size {order.executed.size:.4f}, Price: {order.executed.price:.2f}, PnL: {order.executed.pnl:.2f}')
                 self.reset_cycle()
+                trade_info['type'] = 'sell'
+                self.trades.append(trade_info)
 
     def next(self):
-        # ИСПРАВЛЕНИЕ 3: Проверка на ликвидацию
-        if self.p.is_futures and self.position and self.data.close[0] <= self.liquidation_price:
-            self.log(f'!!! LIQUIDATION at Price: {self.data.close[0]:.2f}. Liquidation Price was: {self.liquidation_price:.2f} !!!')
-            self.close() # Закрываем позицию по рынку
-            self.reset_cycle()
+        # ИСПРАВЛЕНИЕ 2: Если мы ликвидированы, больше не торгуем
+        if self.liquidated:
             return
 
-        # Логика повторного входа
+        if self.p.is_futures and self.position and self.data.close[0] <= self.liquidation_price:
+            self.log(f'!!! LIQUIDATION at Price: {self.data.close[0]:.2f}. Liquidation Price was: {self.liquidation_price:.2f} !!!')
+            self.close()
+            self.liquidated = True # Устанавливаем флаг ликвидации
+            return
+
         if not self.position:
             self.start_new_cycle()
             return
 
-        # Логика Take Profit
         if self.position and self.data.close[0] >= self.take_profit_price:
             self.sell(size=self.position.size)
 
-        # Логика страховочных ордеров
         if self.safety_orders_placed < self.p.safety_orders_count:
             step = self.p.price_step_percent / 100.0 * (self.p.price_step_multiplier ** self.safety_orders_placed)
             next_safety_price = self.entry_price * (1 - step)
@@ -96,22 +86,19 @@ class DcaGridStrategy(bt.Strategy):
                 self.safety_orders_placed += 1
 
     def start_new_cycle(self):
-        initial_size = self.p.initial_order_size / self.data.close[0]
-        self.buy(size=initial_size)
-        self.log(f'NEW CYCLE STARTED: Initial Buy @ {self.data.close[0]:.2f}')
+        self.buy(size=self.p.initial_order_size / self.data.close[0])
 
     def reset_cycle(self):
-        self.total_cost = 0
-        self.total_size = 0
-        self.safety_orders_placed = 0
+        self.total_cost = 0; self.total_size = 0; self.safety_orders_placed = 0
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
-        log_container.write(f'{dt.isoformat()} - {txt}')
+        st.write(f'{dt.isoformat()} - {txt}')
 
-# --- 2. Функция загрузки данных и Пресеты ---
+# --- 2. Функции для данных и нового графика ---
 @st.cache_data
 def fetch_data(exchange_name, symbol, timeframe, start_date):
+    # (код этой функции остался без изменений)
     try:
         exchange = getattr(ccxt, exchange_name)()
         since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -129,20 +116,39 @@ def fetch_data(exchange_name, symbol, timeframe, start_date):
         st.error(f"Ошибка при загрузке данных: {e}")
         return None
 
-# ИСПРАВЛЕНИЕ 2: Новая структура пресетов
+# ИСПРАВЛЕНИЕ 1: Функция для построения интерактивного графика
+def plot_interactive_chart(data_df, trades):
+    fig = go.Figure(data=[go.Candlestick(x=data_df.index,
+                                           open=data_df['open'],
+                                           high=data_df['high'],
+                                           low=data_df['low'],
+                                           close=data_df['close'],
+                                           name='Цена')])
+    buys = [t for t in trades if t['type'] == 'buy']
+    sells = [t for t in trades if t['type'] == 'sell']
+
+    fig.add_trace(go.Scatter(x=[t['dt'] for t in buys], y=[t['price'] for t in buys],
+                             mode='markers', name='Покупки (Buy)',
+                             marker=dict(color='green', size=10, symbol='triangle-up')))
+
+    fig.add_trace(go.Scatter(x=[t['dt'] for t in sells], y=[t['price'] for t in sells],
+                             mode='markers', name='Продажи (Sell)',
+                             marker=dict(color='red', size=10, symbol='triangle-down')))
+
+    fig.update_layout(title='Интерактивный график цены и сделок',
+                      xaxis_title='Дата',
+                      yaxis_title='Цена',
+                      xaxis_rangeslider_visible=True,
+                      template='plotly_dark')
+    return fig
+
 PRESETS = {
-    "okx": {
-        "Spot": {"BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT"},
-        "Futures": {"BTC/USDT": "BTC-USDT-SWAP", "ETH/USDT": "ETH-USDT-SWAP"}
-    },
-    "bitmex": {
-        "Spot": {}, # У BitMEX нет традиционного спота в CCXT
-        "Futures": {"XBT/USDT": "XBTUSDT", "ETH/USDT": "ETHUSDT"}
-    }
+    "okx": {"Spot": {"BTC/USDT": "BTC-USDT"}, "Futures": {"BTC/USDT": "BTC-USDT-SWAP"}},
+    "bitmex": {"Futures": {"XBT/USDT": "XBTUSDT"}}
 }
 
 # --- 3. Интерфейс Streamlit ---
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide", initial_sidebar_state="expanded")
 st.title("📈 Продвинутый бэктестер для сеточной DCA-стратегии")
 
 with st.sidebar:
@@ -152,7 +158,6 @@ with st.sidebar:
 
     available_pairs = list(PRESETS[exchange][instrument].keys())
     if not available_pairs:
-        st.warning(f"Для {exchange} ({instrument}) нет готовых пресетов. Введите пару вручную.")
         symbol_display = st.text_input("Торговая пара (тикер CCXT)", "BTC-USDT-SWAP")
     else:
         symbol_display = st.selectbox("Торговая пара", available_pairs)
@@ -171,14 +176,20 @@ with st.sidebar:
     price_step_multiplier = st.number_input("Grid step ratio (%)", value=1.5)
     take_profit_percent = st.number_input("Take Profit (%)", value=2.0)
 
-    # Поля только для фьючерсов
-    leverage = 1
-    funding_rate = 0.0
+    # ИСПРАВЛЕНИЕ 3: Кастомные комиссии
+    st.header("💰 Комиссии и плечо")
     is_futures = (instrument == "Futures")
-    if is_futures:
-        st.header("📈 Параметры фьючерсов")
-        leverage = st.slider("Плечо (Leverage)", 1, 100, 10)
-        funding_rate = st.number_input("Средняя ставка финансирования (%)", value=0.01, format="%.4f") / 100.0
+    use_custom_commissions = st.checkbox("Учитывать кастомные комиссии и плечо")
+    commission = 0.001 # 0.1% по умолчанию
+    leverage = 1
+    if use_custom_commissions:
+        if is_futures:
+            st.markdown("<p style='color:orange;'>Укажите комиссии для фьючерсов:</p>", unsafe_allow_html=True)
+            commission = st.number_input("Комиссия мейкера/тейкера (%)", value=0.05, format="%.4f") / 100.0
+            leverage = st.slider("Плечо (Leverage)", 1, 100, 10)
+        else:
+            st.markdown("<p style='color:orange;'>Укажите комиссию для спота:</p>", unsafe_allow_html=True)
+            commission = st.number_input("Комиссия (%)", value=0.1, format="%.4f") / 100.0
 
 if st.sidebar.button("🚀 Запустить бэктест"):
     start_datetime = datetime.combine(start_date, datetime.min.time())
@@ -192,35 +203,27 @@ if st.sidebar.button("🚀 Запустить бэктест"):
 
         cerebro = bt.Cerebro()
         cerebro.adddata(data_feed)
-        cerebro.addstrategy(DcaGridStrategy,
-                            initial_order_size=initial_order_size,
-                            safety_order_size=safety_order_size,
-                            safety_orders_count=safety_orders_count,
-                            price_step_percent=price_step_percent,
-                            price_step_multiplier=price_step_multiplier,
-                            take_profit_percent=take_profit_percent,
-                            is_futures=is_futures,
-                            leverage=leverage,
-                            funding_rate=funding_rate
-                            )
+        strategy = cerebro.addstrategy(DcaGridStrategy,
+                            is_futures=is_futures, leverage=leverage, **st.session_state)
 
         cerebro.broker.set_cash(initial_cash)
-        cerebro.broker.setcommission(commission=0.001, leverage=leverage if is_futures else None)
+        cerebro.broker.setcommission(commission=commission, leverage=leverage if is_futures else None)
 
-        st.header("📋 Лог сделок")
-        log_container = st.expander("Показать/скрыть лог", expanded=False)
+        log_container = st.expander("Показать/скрыть лог сделок", expanded=False)
 
         start_value = cerebro.broker.getvalue()
-        cerebro.run()
+        results = cerebro.run()
         end_value = cerebro.broker.getvalue()
 
         st.header("📊 Результаты")
+        pnl = end_value - start_value
         col1, col2 = st.columns(2)
         with col1:
             st.metric("Начальный капитал", f"${start_value:,.2f}")
         with col2:
-            st.metric("Конечный капитал", f"${end_value:,.2f}", delta=f"${end_value - start_value:,.2f}")
+            # ИСПРАВЛЕНИЕ 4: Правильная стрелочка для убытка
+            st.metric("Конечный капитал", f"${end_value:,.2f}", delta=pnl)
 
-        st.subheader("График")
-        fig = cerebro.plot(style='candlestick', barup='green', bardown='red')[0][0]
-        st.pyplot(fig)
+        st.subheader("Интерактивный график")
+        fig = plot_interactive_chart(data_df, results[0].trades)
+        st.plotly_chart(fig, use_container_width=True)
