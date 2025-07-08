@@ -2,3 +2,4 @@ streamlit
 pandas
 ccxt
 backtrader
+matplotlib

@@ -13,8 +13,7 @@ import ccxt
 import backtrader as bt
 from datetime import datetime, timezone
 
-# --- 1. Класс Стратегии для Backtrader ---
-# Логика самого бота остается такой же, как и раньше.
+# --- 1. Класс Стратегии для Backtrader (С ИСПРАВЛЕННОЙ ЛОГИКОЙ) ---
 class DcaGridStrategy(bt.Strategy):
     params = (
         ('initial_order_size', 10.0),
@@ -30,14 +29,7 @@ class DcaGridStrategy(bt.Strategy):
         self.total_cost = 0
         self.total_size = 0
         self.take_profit_price = 0
-        self.last_safety_price = 0
         self.safety_orders_placed = 0
-
-    def start(self):
-        initial_size = self.p.initial_order_size / self.data.close[0]
-        self.buy(size=initial_size)
-        self.log(f'INITIAL BUY: {initial_size:.4f} @ {self.data.close[0]:.2f}')
-        self.last_safety_price = self.data.close[0]
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -49,43 +41,63 @@ class DcaGridStrategy(bt.Strategy):
                 self.take_profit_price = self.entry_price * (1 + self.p.take_profit_percent / 100)
             elif order.issell():
                 self.log(f'SELL EXECUTED (TAKE PROFIT): Size {order.executed.size:.4f}, Price: {order.executed.price:.2f}, PnL: {order.executed.pnl:.2f}')
+                # Сбрасываем состояние для нового цикла
                 self.total_cost = 0
                 self.total_size = 0
                 self.safety_orders_placed = 0
 
     def next(self):
+        # --- ИСПРАВЛЕНИЕ: Логика повторного входа в рынок ---
+        # Если мы не в позиции, начинаем новый цикл с начального ордера
+        if not self.position:
+            initial_size = self.p.initial_order_size / self.data.close[0]
+            self.buy(size=initial_size)
+            self.log(f'NEW CYCLE STARTED: Initial Buy {initial_size:.4f} @ {self.data.close[0]:.2f}')
+            return # Выходим, чтобы избежать других проверок на этой свече
+
+        # --- Логика Take Profit ---
         if self.position and self.data.close[0] >= self.take_profit_price:
             self.sell(size=self.position.size)
             self.log(f'TAKE PROFIT ORDER PLACED at {self.data.close[0]:.2f}')
 
+        # --- Логика выставления страховочных ордеров ---
+        # Считаем отклонение от средней цены входа, а не от последнего ордера
         if self.safety_orders_placed < self.p.safety_orders_count:
             step = self.p.price_step_percent / 100.0 * (self.p.price_step_multiplier ** self.safety_orders_placed)
-            next_safety_price = self.last_safety_price * (1 - step)
+            next_safety_price = self.entry_price * (1 - step)
+
             if self.data.close[0] <= next_safety_price:
                 order_size = self.p.safety_order_size / self.data.close[0]
                 self.buy(size=order_size)
                 self.log(f'SAFETY ORDER PLACED: {self.safety_orders_placed + 1} at {self.data.close[0]:.2f}')
-                self.last_safety_price = self.data.close[0]
                 self.safety_orders_placed += 1
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
-        st.write(f'{dt.isoformat()} - {txt}')
+        # Используем st.empty() для вывода логов в один блок с прокруткой
+        log_container.write(f'{dt.isoformat()} - {txt}')
+
 
 # --- 2. Функция для загрузки данных через CCXT ---
+@st.cache_data
 def fetch_data(exchange_name, symbol, timeframe, start_date, end_date):
     try:
         exchange_class = getattr(ccxt, exchange_name)
         exchange = exchange_class()
 
         start_ts = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-        end_ts = int(end_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=start_ts, limit=5000)
-        if not ohlcv:
-            return None
+        all_ohlcv = []
+        while start_ts < int(end_date.replace(tzinfo=timezone.utc).timestamp() * 1000):
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=start_ts, limit=1000)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            start_ts = ohlcv[-1][0] + 1
 
-        df = pd.DataFrame(ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+        if not all_ohlcv: return None
+
+        df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
         df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
         df.set_index('datetime', inplace=True)
         return df
@@ -95,16 +107,17 @@ def fetch_data(exchange_name, symbol, timeframe, start_date, end_date):
 
 # --- 3. Интерфейс Streamlit ---
 st.set_page_config(layout="wide")
-st.title("📈 Бэктестер для сеточной DCA-стратегии на CCXT")
+st.title("📈 Бэктестер для сеточной DCA-стратегии")
 
 with st.sidebar:
     st.header("⚙️ Параметры бэктеста")
-    exchange_name = st.selectbox("Биржа", ['binance', 'bybit', 'okx', 'kucoin', 'gateio'])
+    # --- ИСПРАВЛЕНИЕ: Убираем лишние биржи ---
+    exchange_name = st.selectbox("Биржа", ['okx', 'bmex'])
     symbol = st.text_input("Торговая пара", "BTC/USDT")
     timeframe = st.selectbox("Таймфрейм", ['1d', '4h', '1h', '30m', '15m', '5m'])
     start_date = st.date_input("Дата начала", datetime(2023, 1, 1))
     end_date = st.date_input("Дата окончания", datetime.now())
-    initial_cash = st.number_input("Начальный капитал", value=10000.0)
+    initial_cash = st.number_input("Начальный капитал", value=10000.0, step=1000.0)
 
     st.header("🛠️ Параметры стратегии")
     initial_order_size = st.number_input("Начальный ордер ($)", value=100.0)
@@ -115,11 +128,10 @@ with st.sidebar:
     take_profit_percent = st.number_input("Take Profit (%)", value=2.0)
 
 if st.sidebar.button("🚀 Запустить бэктест"):
-    with st.spinner(f"Загружаем данные с {exchange_name}..."):
-        # Преобразуем даты в datetime объекты для функции
-        start_datetime = datetime.combine(start_date, datetime.min.time())
-        end_datetime = datetime.combine(end_date, datetime.max.time())
+    start_datetime = datetime.combine(start_date, datetime.min.time())
+    end_datetime = datetime.combine(end_date, datetime.max.time())
 
+    with st.spinner(f"Загружаем данные с {exchange_name}..."):
         data_df = fetch_data(exchange_name, symbol, timeframe, start_datetime, end_datetime)
 
     if data_df is not None and not data_df.empty:
@@ -137,8 +149,11 @@ if st.sidebar.button("🚀 Запустить бэктест"):
                             take_profit_percent=take_profit_percent)
 
         cerebro.broker.set_cash(initial_cash)
+        cerebro.broker.setcommission(commission=0.001) # Комиссия 0.1%
 
         st.header("📋 Лог сделок")
+        log_container = st.expander("Показать/скрыть лог", expanded=False)
+
         start_value = cerebro.broker.getvalue()
         cerebro.run()
         end_value = cerebro.broker.getvalue()
