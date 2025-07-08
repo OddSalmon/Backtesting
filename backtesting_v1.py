@@ -82,25 +82,21 @@ class DcaGridStrategy(bt.Strategy):
 @st.cache_data
 def fetch_data(exchange_name, symbol, timeframe, start_date):
     try:
-        exchange = getattr(ccxt, exchange_name)()
-        since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        exchange = getattr(ccxt, exchange_name)(); since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
         all_ohlcv = []
         while True:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
-            # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
             if not ohlcv:
                 break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
             
         df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
-        df.set_index('datetime', inplace=True)
-        return df
+        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms'); df.set_index('datetime', inplace=True); return df
     except Exception as e:
-        st.error(f"Ошибка: {e}")
-        return None
+        st.error(f"Ошибка: {e}"); return None
 
+# Функция графика остается в коде, но мы не будем ее вызывать
 def plot_interactive_chart(data_df, trades, show_trades=False):
     fig = go.Figure(data=[go.Candlestick(x=data_df.index, open=data_df['open'], high=data_df['high'], low=data_df['low'], close=data_df['close'], name='Цена')])
     if show_trades:
@@ -193,12 +189,17 @@ if st.sidebar.button("🚀 Запустить бэктест"):
         pnl = end_value - start_value
         max_drawdown = results[0].analyzers.drawdown.get_analysis()['max']['drawdown']
         
-        col1, col2, col3 = st.columns(3)
+        # --- ИЗМЕНЕНИЕ 1: Добавляем счетчик сделок ---
+        total_trades = len(results[0].trades)
+        
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Начальный капитал", f"${start_value:,.2f}")
         col2.metric("Конечный капитал", f"${end_value:,.2f}", f"{pnl:,.2f}")
-        col3.metric("Макс. просадка в тесте (%)", f"{max_drawdown:.2f}%")
+        col3.metric("Макс. просадка (%)", f"{max_drawdown:.2f}%")
+        col4.metric("Количество сделок", total_trades)
 
-        st.subheader("Интерактивный график")
-        show_trades_on_chart = st.checkbox("Показать все сделки на графике", value=True)
-        fig = plot_interactive_chart(data_df, results[0].trades, show_trades=show_trades_on_chart)
-        st.plotly_chart(fig, use_container_width=True)
+        # --- ИЗМЕНЕНИЕ 2: Комментируем все, что связано с графиком ---
+        # st.subheader("Интерактивный график")
+        # show_trades_on_chart = st.checkbox("Показать все сделки на графике", value=True)
+        # fig = plot_interactive_chart(data_df, results[0].trades, show_trades=show_trades_on_chart)
+        # st.plotly_chart(fig, use_container_width=True)
