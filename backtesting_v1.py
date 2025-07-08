@@ -82,13 +82,24 @@ class DcaGridStrategy(bt.Strategy):
 @st.cache_data
 def fetch_data(exchange_name, symbol, timeframe, start_date):
     try:
-        exchange = getattr(ccxt, exchange_name)(); since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-        all_ohlcv = [];
-        while True: ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000);
-            if not ohlcv: break; all_ohlcv.extend(ohlcv); since = ohlcv[-1][0] + 1
+        exchange = getattr(ccxt, exchange_name)()
+        since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        all_ohlcv = []
+        while True:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1
+            
         df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms'); df.set_index('datetime', inplace=True); return df
-    except Exception as e: st.error(f"Ошибка: {e}"); return None
+        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+        df.set_index('datetime', inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Ошибка: {e}")
+        return None
 
 def plot_interactive_chart(data_df, trades, show_trades=False):
     fig = go.Figure(data=[go.Candlestick(x=data_df.index, open=data_df['open'], high=data_df['high'], low=data_df['low'], close=data_df['close'], name='Цена')])
@@ -99,7 +110,6 @@ def plot_interactive_chart(data_df, trades, show_trades=False):
     fig.update_layout(title='Интерактивный график цены и сделок', xaxis_rangeslider_visible=True, template='plotly_dark')
     return fig
 
-# ИСПРАВЛЕНИЕ 2: Расширенная библиотека торговых пар
 PRESETS = {
     "okx": {
         "Spot": {"BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT", "SOL/USDT": "SOL-USDT", "LTC/USDT": "LTC-USDT", "XRP/USDT": "XRP-USDT", "DOGE/USDT": "DOGE-USDT", "TON/USDT": "TON-USDT"},
@@ -137,7 +147,6 @@ with st.sidebar:
     price_step_multiplier = st.number_input("Grid step ratio (%)", value=1.5, min_value=0.1, format="%.2f")
     take_profit_percent = st.number_input("Take Profit (%)", value=2.0, min_value=0.1, format="%.2f")
 
-    # ИСПРАВЛЕНИЕ 3: Отображение заданного Trading Range
     steps = [price_step_percent * (price_step_multiplier ** i) for i in range(safety_orders_count)]
     theoretical_range = sum(steps)
     st.metric("Заданный Trading Range (%)", f"{theoretical_range:.2f}%")
@@ -164,7 +173,6 @@ if st.sidebar.button("🚀 Запустить бэктест"):
         
         cerebro = bt.Cerebro()
         cerebro.adddata(bt.feeds.PandasData(dataname=data_df))
-        # Добавляем анализатор просадки
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         
         strategy_params = {'initial_order_size': initial_order_size, 'safety_order_size': safety_order_size, 'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent, 'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent, 'direction': direction, 'is_futures': is_futures, 'leverage': leverage}
@@ -178,7 +186,6 @@ if st.sidebar.button("🚀 Запустить бэктест"):
         results = cerebro.run()
         end_value = cerebro.broker.getvalue()
 
-        # ИСПРАВЛЕНИЕ 1: Проверяем флаг ликвидации и значительность потерь
         if results[0].liquidated and end_value < initial_cash * 0.1:
             st.markdown("""<div style='background-color:#FF4B4B;padding:20px;border-radius:10px;text-align:center;'><h1 style='color:white;margin:0;'>🚨 БОТ ЛИКВИДИРОВАН 🚨</h1></div>""", unsafe_allow_html=True)
 
@@ -189,7 +196,6 @@ if st.sidebar.button("🚀 Запустить бэктест"):
         col1, col2, col3 = st.columns(3)
         col1.metric("Начальный капитал", f"${start_value:,.2f}")
         col2.metric("Конечный капитал", f"${end_value:,.2f}", f"{pnl:,.2f}")
-        # ИСПРАВЛЕНИЕ 3: Выводим макс. просадку для сравнения
         col3.metric("Макс. просадка в тесте (%)", f"{max_drawdown:.2f}%")
 
         st.subheader("Интерактивный график")
