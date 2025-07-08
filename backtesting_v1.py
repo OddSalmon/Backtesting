@@ -12,16 +12,25 @@ import pandas as pd
 import ccxt
 import backtrader as bt
 from datetime import datetime, timezone
+import matplotlib
 
-# --- 1. Класс Стратегии для Backtrader (С ИСПРАВЛЕННОЙ ЛОГИКОЙ) ---
+# ИСПРАВЛЕНИЕ 1: Решаем проблему с графиком в серверной среде
+matplotlib.use('Agg')
+
+# --- 1. Класс Стратегии для Backtrader (с логикой для фьючерсов) ---
 class DcaGridStrategy(bt.Strategy):
     params = (
-        ('initial_order_size', 10.0),
-        ('safety_order_size', 10.0),
-        ('price_step_percent', 1.0),
+        # Параметры стратегии
+        ('initial_order_size', 100.0),
+        ('safety_order_size', 100.0),
+        ('price_step_percent', 2.0),
         ('price_step_multiplier', 1.5),
-        ('safety_orders_count', 20),
-        ('take_profit_percent', 1.0),
+        ('safety_orders_count', 10),
+        ('take_profit_percent', 2.0),
+        # Параметры фьючерсов
+        ('is_futures', False),
+        ('leverage', 1),
+        ('funding_rate', 0.0001), # Средняя ставка финансирования 0.01%
     )
 
     def __init__(self):
@@ -29,7 +38,21 @@ class DcaGridStrategy(bt.Strategy):
         self.total_cost = 0
         self.total_size = 0
         self.take_profit_price = 0
+        self.liquidation_price = 0
         self.safety_orders_placed = 0
+        # Таймер для списания funding'а каждые 8 часов
+        if self.p.is_futures:
+            self.add_timer(
+                when=bt.Timer.SESSION_START,
+                offset=bt.timedelta(hours=8),
+                repeat=bt.timedelta(hours=8)
+            )
+
+    def notify_timer(self, timer, when, *args):
+        # Списываем комиссию за финансирование
+        funding_fee = self.broker.get_value() * self.p.funding_rate
+        self.broker.add_cash(-funding_fee)
+        self.log(f'FUNDING FEE: -${funding_fee:.2f} charged.')
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -39,64 +62,65 @@ class DcaGridStrategy(bt.Strategy):
                 self.total_size += order.executed.size
                 self.entry_price = self.total_cost / self.total_size
                 self.take_profit_price = self.entry_price * (1 + self.p.take_profit_percent / 100)
+                # Рассчитываем цену ликвидации (упрощенно)
+                if self.p.is_futures:
+                    self.liquidation_price = self.entry_price * (1 - (1 / self.p.leverage))
             elif order.issell():
-                self.log(f'SELL EXECUTED (TAKE PROFIT): Size {order.executed.size:.4f}, Price: {order.executed.price:.2f}, PnL: {order.executed.pnl:.2f}')
-                # Сбрасываем состояние для нового цикла
-                self.total_cost = 0
-                self.total_size = 0
-                self.safety_orders_placed = 0
+                self.log(f'SELL EXECUTED: Size {order.executed.size:.4f}, Price: {order.executed.price:.2f}, PnL: {order.executed.pnl:.2f}')
+                self.reset_cycle()
 
     def next(self):
-        # --- ИСПРАВЛЕНИЕ: Логика повторного входа в рынок ---
-        # Если мы не в позиции, начинаем новый цикл с начального ордера
-        if not self.position:
-            initial_size = self.p.initial_order_size / self.data.close[0]
-            self.buy(size=initial_size)
-            self.log(f'NEW CYCLE STARTED: Initial Buy {initial_size:.4f} @ {self.data.close[0]:.2f}')
-            return # Выходим, чтобы избежать других проверок на этой свече
+        # ИСПРАВЛЕНИЕ 3: Проверка на ликвидацию
+        if self.p.is_futures and self.position and self.data.close[0] <= self.liquidation_price:
+            self.log(f'!!! LIQUIDATION at Price: {self.data.close[0]:.2f}. Liquidation Price was: {self.liquidation_price:.2f} !!!')
+            self.close() # Закрываем позицию по рынку
+            self.reset_cycle()
+            return
 
-        # --- Логика Take Profit ---
+        # Логика повторного входа
+        if not self.position:
+            self.start_new_cycle()
+            return
+
+        # Логика Take Profit
         if self.position and self.data.close[0] >= self.take_profit_price:
             self.sell(size=self.position.size)
-            self.log(f'TAKE PROFIT ORDER PLACED at {self.data.close[0]:.2f}')
 
-        # --- Логика выставления страховочных ордеров ---
-        # Считаем отклонение от средней цены входа, а не от последнего ордера
+        # Логика страховочных ордеров
         if self.safety_orders_placed < self.p.safety_orders_count:
             step = self.p.price_step_percent / 100.0 * (self.p.price_step_multiplier ** self.safety_orders_placed)
             next_safety_price = self.entry_price * (1 - step)
-
             if self.data.close[0] <= next_safety_price:
                 order_size = self.p.safety_order_size / self.data.close[0]
                 self.buy(size=order_size)
-                self.log(f'SAFETY ORDER PLACED: {self.safety_orders_placed + 1} at {self.data.close[0]:.2f}')
                 self.safety_orders_placed += 1
+
+    def start_new_cycle(self):
+        initial_size = self.p.initial_order_size / self.data.close[0]
+        self.buy(size=initial_size)
+        self.log(f'NEW CYCLE STARTED: Initial Buy @ {self.data.close[0]:.2f}')
+
+    def reset_cycle(self):
+        self.total_cost = 0
+        self.total_size = 0
+        self.safety_orders_placed = 0
 
     def log(self, txt, dt=None):
         dt = dt or self.datas[0].datetime.date(0)
-        # Используем st.empty() для вывода логов в один блок с прокруткой
         log_container.write(f'{dt.isoformat()} - {txt}')
 
-
-# --- 2. Функция для загрузки данных через CCXT ---
+# --- 2. Функция загрузки данных и Пресеты ---
 @st.cache_data
-def fetch_data(exchange_name, symbol, timeframe, start_date, end_date):
+def fetch_data(exchange_name, symbol, timeframe, start_date):
     try:
-        exchange_class = getattr(ccxt, exchange_name)
-        exchange = exchange_class()
-
-        start_ts = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-
+        exchange = getattr(ccxt, exchange_name)()
+        since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
         all_ohlcv = []
-        while start_ts < int(end_date.replace(tzinfo=timezone.utc).timestamp() * 1000):
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=start_ts, limit=1000)
-            if not ohlcv:
-                break
+        while True:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            if not ohlcv: break
             all_ohlcv.extend(ohlcv)
-            start_ts = ohlcv[-1][0] + 1
-
-        if not all_ohlcv: return None
-
+            since = ohlcv[-1][0] + 1
         df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
         df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
         df.set_index('datetime', inplace=True)
@@ -105,19 +129,39 @@ def fetch_data(exchange_name, symbol, timeframe, start_date, end_date):
         st.error(f"Ошибка при загрузке данных: {e}")
         return None
 
+# ИСПРАВЛЕНИЕ 2: Новая структура пресетов
+PRESETS = {
+    "okx": {
+        "Spot": {"BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT"},
+        "Futures": {"BTC/USDT": "BTC-USDT-SWAP", "ETH/USDT": "ETH-USDT-SWAP"}
+    },
+    "bitmex": {
+        "Spot": {}, # У BitMEX нет традиционного спота в CCXT
+        "Futures": {"XBT/USDT": "XBTUSDT", "ETH/USDT": "ETHUSDT"}
+    }
+}
+
 # --- 3. Интерфейс Streamlit ---
 st.set_page_config(layout="wide")
-st.title("📈 Бэктестер для сеточной DCA-стратегии")
+st.title("📈 Продвинутый бэктестер для сеточной DCA-стратегии")
 
 with st.sidebar:
     st.header("⚙️ Параметры бэктеста")
-    # --- ИСПРАВЛЕНИЕ: Убираем лишние биржи ---
-    exchange_name = st.selectbox("Биржа", ['okx', 'bmex'])
-    symbol = st.text_input("Торговая пара", "BTC/USDT")
-    timeframe = st.selectbox("Таймфрейм", ['1d', '4h', '1h', '30m', '15m', '5m'])
+    exchange = st.selectbox("Биржа", list(PRESETS.keys()))
+    instrument = st.selectbox("Инструмент", list(PRESETS[exchange].keys()))
+
+    available_pairs = list(PRESETS[exchange][instrument].keys())
+    if not available_pairs:
+        st.warning(f"Для {exchange} ({instrument}) нет готовых пресетов. Введите пару вручную.")
+        symbol_display = st.text_input("Торговая пара (тикер CCXT)", "BTC-USDT-SWAP")
+    else:
+        symbol_display = st.selectbox("Торговая пара", available_pairs)
+
+    symbol_ccxt = PRESETS[exchange][instrument].get(symbol_display, symbol_display)
+
+    timeframe = st.selectbox("Таймфрейм", ['1d', '4h', '1h'])
     start_date = st.date_input("Дата начала", datetime(2023, 1, 1))
-    end_date = st.date_input("Дата окончания", datetime.now())
-    initial_cash = st.number_input("Начальный капитал", value=10000.0, step=1000.0)
+    initial_cash = st.number_input("Начальный капитал", value=10000.0)
 
     st.header("🛠️ Параметры стратегии")
     initial_order_size = st.number_input("Начальный ордер ($)", value=100.0)
@@ -127,15 +171,23 @@ with st.sidebar:
     price_step_multiplier = st.number_input("Grid step ratio (%)", value=1.5)
     take_profit_percent = st.number_input("Take Profit (%)", value=2.0)
 
+    # Поля только для фьючерсов
+    leverage = 1
+    funding_rate = 0.0
+    is_futures = (instrument == "Futures")
+    if is_futures:
+        st.header("📈 Параметры фьючерсов")
+        leverage = st.slider("Плечо (Leverage)", 1, 100, 10)
+        funding_rate = st.number_input("Средняя ставка финансирования (%)", value=0.01, format="%.4f") / 100.0
+
 if st.sidebar.button("🚀 Запустить бэктест"):
     start_datetime = datetime.combine(start_date, datetime.min.time())
-    end_datetime = datetime.combine(end_date, datetime.max.time())
 
-    with st.spinner(f"Загружаем данные с {exchange_name}..."):
-        data_df = fetch_data(exchange_name, symbol, timeframe, start_datetime, end_datetime)
+    with st.spinner(f"Загружаем данные для {symbol_ccxt} с {exchange}..."):
+        data_df = fetch_data(exchange, symbol_ccxt, timeframe, start_datetime)
 
     if data_df is not None and not data_df.empty:
-        st.success(f"Данные для {symbol} ({timeframe}) успешно загружены.")
+        st.success("Данные успешно загружены.")
         data_feed = bt.feeds.PandasData(dataname=data_df)
 
         cerebro = bt.Cerebro()
@@ -146,10 +198,14 @@ if st.sidebar.button("🚀 Запустить бэктест"):
                             safety_orders_count=safety_orders_count,
                             price_step_percent=price_step_percent,
                             price_step_multiplier=price_step_multiplier,
-                            take_profit_percent=take_profit_percent)
+                            take_profit_percent=take_profit_percent,
+                            is_futures=is_futures,
+                            leverage=leverage,
+                            funding_rate=funding_rate
+                            )
 
         cerebro.broker.set_cash(initial_cash)
-        cerebro.broker.setcommission(commission=0.001) # Комиссия 0.1%
+        cerebro.broker.setcommission(commission=0.001, leverage=leverage if is_futures else None)
 
         st.header("📋 Лог сделок")
         log_container = st.expander("Показать/скрыть лог", expanded=False)
