@@ -187,18 +187,20 @@ if st.sidebar.button("🚀 Запустить бэктест"):
 
         st.header("📊 Результаты")
         pnl = end_value - start_value
+        pnl_percent = (pnl / start_value) * 100 if start_value > 0 else 0
         max_drawdown = results[0].analyzers.drawdown.get_analysis()['max']['drawdown']
-        
-        # --- ИЗМЕНЕНИЕ 1: Добавляем счетчик сделок ---
         total_trades = len(results[0].trades)
         
+        # --- ИЗМЕНЕНИЕ: Новая структура вывода результатов ---
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Начальный капитал", f"${start_value:,.2f}")
-        col2.metric("Конечный капитал", f"${end_value:,.2f}", f"{pnl:,.2f}")
-        col3.metric("Макс. просадка (%)", f"{max_drawdown:.2f}%")
+        col2.metric("Конечный капитал", f"${end_value:,.2f}", f"{pnl:,.2f} $")
+        col3.metric("Прибыль/убыток (%)", f"{pnl_percent:.2f}%")
         col4.metric("Количество сделок", total_trades)
 
-        # --- ИЗМЕНЕНИЕ 2: Комментируем все, что связано с графиком ---
+        st.metric("Макс. просадка в тесте (%)", f"{max_drawdown:.2f}%")
+
+        # --- График остается закомментированным ---
         # st.subheader("Интерактивный график")
         # show_trades_on_chart = st.checkbox("Показать все сделки на графике", value=True)
         # fig = plot_interactive_chart(data_df, results[0].trades, show_trades=show_trades_on_chart)
