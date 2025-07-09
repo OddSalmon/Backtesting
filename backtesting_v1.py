@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 # --- 1. Новый, быстрый движок для бэктеста ---
 def run_fast_backtest(data, params):
-    # Извлекаем параметры
+    # Извлекаем параметры для удобства
     direction = params['direction']
     initial_order_size = params['initial_order_size']
     safety_order_size = params['safety_order_size']
@@ -43,12 +43,12 @@ def run_fast_backtest(data, params):
                     open_orders.pop(0)
         
         # --- Логика входа и страховочных ордеров ---
-        if not open_orders:
-            entry_price = row['open']
+        if not open_orders: # Если нет открытых позиций, делаем начальный ордер
+            entry_price = row['open'] # Входим по цене открытия дня
             size_coin = initial_order_size / entry_price
             open_orders.append({'price': entry_price, 'size_coin': size_coin, 'size_usd': initial_order_size, 'so_level': 0})
             cash -= initial_order_size
-        else:
+        else: # Если уже есть позиция, проверяем страховочные ордера
             if len(open_orders) <= safety_orders_count:
                 last_order_price = open_orders[-1]['price']
                 current_so_level = open_orders[-1]['so_level']
@@ -69,7 +69,7 @@ def run_fast_backtest(data, params):
                         open_orders.append({'price': so_price, 'size_coin': so_size_coin, 'size_usd': so_size_usd, 'so_level': current_so_level + 1})
                         cash -= so_size_usd
 
-    # --- ИЗМЕНЕНИЕ: Собираем финальную статистику по "застрявшим" ордерам ---
+    # --- Собираем финальную статистику по "застрявшим" ордерам ---
     final_open_positions_value = 0
     total_open_size_coin = 0
     total_open_cost_usd = 0
@@ -103,12 +103,27 @@ def run_fast_backtest(data, params):
 @st.cache_data
 def fetch_data(exchange_name, symbol, timeframe, start_date):
     try:
-        exchange = getattr(ccxt, exchange_name)(); since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=2000)
-        if not ohlcv: return None
-        df = pd.DataFrame(ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
-        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms'); df.set_index('datetime', inplace=True); return df
-    except Exception as e: st.error(f"Ошибка загрузки данных: {e}"); return None
+        exchange = getattr(ccxt, exchange_name)()
+        since = int(start_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        
+        # --- ИСПРАВЛЕНИЕ: Добавляем цикл для загрузки ВСЕХ данных ---
+        all_ohlcv = []
+        while True:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1 # Обновляем 'since' для следующего запроса
+
+        if not all_ohlcv: return None
+
+        df = pd.DataFrame(all_ohlcv, columns=['datetime', 'open', 'high', 'low', 'close', 'volume'])
+        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+        df.set_index('datetime', inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Ошибка загрузки данных: {e}")
+        return None
 
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
 st.title("⚡️ Сверхбыстрый бэктестер для сеточной DCA-стратегии (FIFO)")
@@ -154,7 +169,6 @@ if st.sidebar.button("🚀 Запустить бэктест"):
         col2.metric("Конечный капитал", f"${final_cash:,.2f}", f"{pnl:,.2f} $")
         col3.metric("Завершено циклов", len(completed_cycles))
 
-        # --- ИЗМЕНЕНИЕ: Новый блок с итоговым состоянием бота ---
         st.header("🏁 Итоговое состояние бота")
         if final_state['open_orders_count'] > 0:
             st.warning(f"Бот застрял в позиции к концу периода.", icon="⚠️")
