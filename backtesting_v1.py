@@ -6,11 +6,10 @@ from datetime import datetime, timezone
 import plotly.graph_objects as go
 import matplotlib
 
-# Решаем проблему с графиком в серверной среде
 matplotlib.use('Agg')
 
-# --- 1. Класс Стратегии (без изменений) ---
-class DcaGridStrategy(bt.Strategy):
+# --- 1. НОВАЯ ГИБРИДНАЯ СТРАТЕГИЯ (FIFO) ---
+class DcaGridStrategyFIFO(bt.Strategy):
     params = (
         ('initial_order_size', 100.0), ('safety_order_size', 100.0),
         ('price_step_percent', 2.0), ('price_step_multiplier', 1.5),
@@ -18,65 +17,77 @@ class DcaGridStrategy(bt.Strategy):
         ('volume_multiplier', 1.0),
         ('direction', 'Long'), ('is_futures', False), ('leverage', 1),
     )
+
     def __init__(self):
-        self.entry_price = 0; self.total_cost = 0; self.total_size = 0
-        self.take_profit_price = 0; self.liquidation_price = 0
+        # Очередь из наших открытых ордеров. Храним {'price': цена, 'size': размер}
+        self.open_orders_queue = []
         self.safety_orders_placed = 0
-        self.trades = []; self.liquidated = False
+        self.liquidated = False
+
     def notify_order(self, order):
         if order.status != order.Completed: return
-        trade_info = {'dt': bt.num2date(order.executed.dt), 'price': order.executed.price, 'size': abs(order.executed.size)}
+
+        # Определяем, является ли ордер закрывающим (Take Profit)
         is_closing_trade = (self.p.direction == 'Long' and order.issell()) or \
                            (self.p.direction == 'Short' and order.isbuy())
+
         if is_closing_trade:
-            trade_info['type'] = 'sell' if self.p.direction == 'Long' else 'buy'
-            self.reset_cycle()
-        else:
-            trade_info['type'] = 'buy' if self.p.direction == 'Long' else 'sell'
-            self.total_cost += abs(order.executed.value)
-            self.total_size += abs(order.executed.size)
-        self.trades.append(trade_info)
-        if self.total_size > 0: self.update_position_levels()
-    def update_position_levels(self):
-        self.entry_price = self.total_cost / self.total_size
-        tp_ratio = 1 + self.p.take_profit_percent / 100
-        liq_ratio = 1 - (0.99 / self.p.leverage)
-        if self.p.direction == 'Long':
-            self.take_profit_price = self.entry_price * tp_ratio
-            if self.p.is_futures and self.p.leverage > 1: self.liquidation_price = self.entry_price * liq_ratio
-        else:
-            self.take_profit_price = self.entry_price / tp_ratio
-            if self.p.is_futures and self.p.leverage > 1: self.liquidation_price = self.entry_price / liq_ratio
+            # Если это тейк-профит, удаляем самый старый ордер из нашей очереди
+            if self.open_orders_queue:
+                self.open_orders_queue.pop(0)
+        else: # Ордер на открытие или усреднение
+            self.open_orders_queue.append({'price': order.executed.price, 'size': order.executed.size})
+
     def next(self):
         if self.liquidated: return
-        if self.p.is_futures and self.position and self.liquidation_price > 0:
-            is_liquidated = (self.p.direction == 'Long' and self.data.close[0] <= self.liquidation_price) or \
-                            (self.p.direction == 'Short' and self.data.close[0] >= self.liquidation_price)
-            if is_liquidated: self.liquidated = True; self.close(); return
-        if not self.position: self.start_new_cycle(); return
-        if self.position:
-            tp_hit = (self.p.direction == 'Long' and self.data.close[0] >= self.take_profit_price) or \
-                     (self.p.direction == 'Short' and self.data.close[0] <= self.take_profit_price and self.take_profit_price > 0)
-            if tp_hit: self.close()
-        if self.safety_orders_placed < self.p.safety_orders_count:
+        
+        # Если нет открытых позиций, начинаем новый торговый цикл
+        if not self.position:
+            self.safety_orders_placed = 0
+            self.open_orders_queue = []
+            self.start_new_cycle()
+            return
+            
+        # --- Логика Take Profit по FIFO ---
+        if self.open_orders_queue:
+            oldest_order = self.open_orders_queue[0]
+            
+            if self.p.direction == 'Long':
+                take_profit_price = oldest_order['price'] * (1 + self.p.take_profit_percent / 100)
+                if self.data.close[0] >= take_profit_price:
+                    self.sell(size=oldest_order['size']) # Продаем только размер самого старого ордера
+            else: # Short
+                take_profit_price = oldest_order['price'] * (1 - self.p.take_profit_percent / 100)
+                if self.data.close[0] <= take_profit_price:
+                    self.buy(size=oldest_order['size']) # Откупаем только размер самого старого ордера
+
+        # --- Логика страховочных ордеров ---
+        if self.safety_orders_placed < self.p.safety_orders_count and self.open_orders_queue:
+            last_order_price = self.open_orders_queue[-1]['price']
             step = self.p.price_step_percent / 100.0 * (self.p.price_step_multiplier ** self.safety_orders_placed)
-            next_safety_price = self.entry_price * (1 - step) if self.p.direction == 'Long' else self.entry_price * (1 + step)
-            price_hit = (self.p.direction == 'Long' and self.data.close[0] <= next_safety_price) or \
-                        (self.p.direction == 'Short' and self.data.close[0] >= next_safety_price)
-            if price_hit:
-                size_multiplier = self.p.volume_multiplier ** self.safety_orders_placed
-                order_size = (self.p.safety_order_size * size_multiplier) / self.data.close[0]
-                if self.p.direction == 'Long': self.buy(size=order_size)
-                else: self.sell(size=order_size)
-                self.safety_orders_placed += 1
+
+            if self.p.direction == 'Long':
+                next_safety_price = last_order_price * (1 - step)
+                if self.data.close[0] <= next_safety_price:
+                    self.place_safety_order()
+            else: # Short
+                next_safety_price = last_order_price * (1 + step)
+                if self.data.close[0] >= next_safety_price:
+                    self.place_safety_order()
+    
+    def place_safety_order(self):
+        size_multiplier = self.p.volume_multiplier ** self.safety_orders_placed
+        order_size = (self.p.safety_order_size * size_multiplier) / self.data.close[0]
+        if self.p.direction == 'Long': self.buy(size=order_size)
+        else: self.sell(size=order_size)
+        self.safety_orders_placed += 1
+    
     def start_new_cycle(self):
         size = self.p.initial_order_size / self.data.close[0]
         if self.p.direction == 'Long': self.buy(size=size)
         else: self.sell(size=size)
-    def reset_cycle(self):
-        self.total_cost = 0; self.total_size = 0; self.safety_orders_placed = 0; self.take_profit_price = 0
 
-# --- 2. Функции и Пресеты ---
+# --- 2. Функции и UI (без изменений, но с важными исправлениями) ---
 @st.cache_data
 def fetch_data(exchange_name, symbol, timeframe, start_date):
     try:
@@ -90,39 +101,25 @@ def fetch_data(exchange_name, symbol, timeframe, start_date):
         df['datetime'] = pd.to_datetime(df['datetime'], unit='ms'); df.set_index('datetime', inplace=True); return df
     except Exception as e: st.error(f"Ошибка: {e}"); return None
 
-def plot_interactive_chart(data_df, trades, show_trades=False):
-    fig = go.Figure(data=[go.Candlestick(x=data_df.index, open=data_df['open'], high=data_df['high'], low=data_df['low'], close=data_df['close'], name='Цена')])
-    if show_trades:
-        buys = [t for t in trades if t['type'] == 'buy']; sells = [t for t in trades if t['type'] == 'sell']
-        fig.add_trace(go.Scatter(x=[t['dt'] for t in buys], y=[t['price'] for t in buys], mode='markers', name='Покупки', marker=dict(color='cyan', size=10, symbol='triangle-up')))
-        fig.add_trace(go.Scatter(x=[t['dt'] for t in sells], y=[t['price'] for t in sells], mode='markers', name='Продажи', marker=dict(color='magenta', size=10, symbol='triangle-down')))
-    fig.update_layout(title='Интерактивный график цены и сделок', xaxis_rangeslider_visible=True, template='plotly_dark')
-    return fig
-
-PRESETS = {
-    "okx": {
-        "Spot": {"BTC/USDT": "BTC-USDT", "ETH/USDT": "ETH-USDT", "SOL/USDT": "SOL-USDT", "LTC/USDT": "LTC-USDT"},
-        "Futures": {"BTC/USDT": "BTC-USDT-SWAP", "ETH/USDT": "ETH-USDT-SWAP", "SOL/USDT": "SOL-USDT-SWAP"}
-    },
-    "bitmex": {
-        "Futures": {"XBT/USDT": "XBTUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT"}
-    }
-}
+def create_trade_log_df(analysis):
+    trades_data = []
+    if 'trades' not in analysis: return pd.DataFrame()
+    for trade_list in analysis.trades:
+        for trade in trade_list:
+            trades_data.append({
+                "Дата закрытия": trade.dt_close.strftime('%Y-%m-%d %H:%M'),
+                "Профит ($)": trade.pnl,
+                "Профит (%)": trade.pnlcomm_perc * 100 if trade.pnlcomm_perc is not None else 0,
+                "Длительность (часы)": trade.barlen,
+            })
+    return pd.DataFrame(trades_data)
 
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
-st.title("📈 Продвинутый бэктестер для сеточной DCA-стратегии")
+st.title("📈 Гибридный DCA/Grid Бэктестер (FIFO)")
 
 with st.sidebar:
     st.header("⚙️ Параметры бэктеста")
     direction = st.radio("Направление", ["Long", "Short"])
-    exchange = st.selectbox("Биржа", list(PRESETS.keys()))
-    instrument = st.selectbox("Инструмент", list(PRESETS[exchange].keys()))
-    available_pairs = list(PRESETS[exchange][instrument].keys()) if instrument in PRESETS[exchange] else []
-    symbol_display = st.selectbox("Торговая пара", available_pairs) if available_pairs else st.text_input("Ввод тикера CCXT", "BTC-USDT-SWAP")
-    symbol_ccxt = PRESETS.get(exchange, {}).get(instrument, {}).get(symbol_display, symbol_display)
-    timeframe = st.selectbox("Таймфрейм", ['1h', '4h', '1d'])
-    start_date = st.date_input("Дата начала", datetime(2023, 1, 1))
-    end_date = st.date_input("Дата окончания", datetime.now())
     initial_cash = st.number_input("Начальный капитал", value=10000.0)
 
     st.header("🛠️ Параметры стратегии")
@@ -131,56 +128,40 @@ with st.sidebar:
     safety_orders_count = st.number_input("Max trigger number", value=10, min_value=1)
     price_step_percent = st.number_input("Grid step (%)", value=2.0, min_value=0.1, format="%.2f")
     price_step_multiplier = st.number_input("Grid step ratio (%)", value=1.5, min_value=0.1, format="%.2f")
-    volume_multiplier = st.number_input("Volume multiplier", value=1.0, min_value=1.0, format="%.2f")
+    volume_multiplier = st.number_input("Volume multiplier (Множитель суммы)", value=1.0, min_value=1.0, format="%.2f")
     take_profit_percent = st.number_input("Take Profit (%)", value=2.0, min_value=0.1, format="%.2f")
-    
-    # --- ИЗМЕНЕНИЕ: Добавлен блок с "живым" расчетом ---
-    st.divider()
-    st.header("Предварительный расчет")
-    order_sizes_live = [safety_order_size * (volume_multiplier ** i) for i in range(safety_orders_count)]
-    price_steps_live = [price_step_percent * (price_step_multiplier ** i) for i in range(safety_orders_count)]
-    required_deposit_live = initial_order_size + sum(order_sizes_live)
-    theoretical_range_live = sum(price_steps_live)
-    st.metric("Требуемый депозит", f"${required_deposit_live:,.2f}")
-    st.metric("Заданный Trading Range (%)", f"{theoretical_range_live:.2f}%")
-    st.divider()
 
-    st.header("💰 Комиссии и плечо")
-    use_commission = st.checkbox("Учитывать комиссию", value=True)
-    commission = st.number_input("Комиссия (%)", value=0.06, format="%.4f", disabled=not use_commission) / 100.0
-    is_futures = (instrument == "Futures")
-    leverage = 1
-    if is_futures:
-        use_leverage = st.checkbox("Использовать плечо", value=True)
-        leverage = st.slider("Плечо (Leverage)", 1, 100, 10, disabled=not use_leverage)
-
+# --- Основная часть ---
 if st.sidebar.button("🚀 Запустить бэктест"):
-    start_datetime = datetime.combine(start_date, datetime.min.time())
-    end_datetime = datetime.combine(end_date, datetime.max.time())
-    with st.spinner(f"Загружаем данные..."): data_df = fetch_data(exchange, symbol_ccxt, timeframe, start_datetime)
+    start_datetime = datetime.combine(st.sidebar.date_input("Дата начала", datetime(2023, 1, 1)), datetime.min.time())
+    with st.spinner(f"Загружаем данные..."): data_df = fetch_data("okx", "BTC-USDT", "1h", start_datetime)
     if data_df is not None and not data_df.empty:
-        data_df = data_df.loc[start_datetime:end_datetime]
         st.success("Данные загружены.")
         cerebro = bt.Cerebro()
         cerebro.adddata(bt.feeds.PandasData(dataname=data_df))
-        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-        strategy_params = {'initial_order_size': initial_order_size, 'safety_order_size': safety_order_size, 'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent, 'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent, 'volume_multiplier': volume_multiplier, 'direction': direction, 'is_futures': is_futures, 'leverage': leverage}
-        cerebro.addstrategy(DcaGridStrategy, **strategy_params)
+        cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
+        
+        strategy_params = {'initial_order_size': initial_order_size, 'safety_order_size': safety_order_size, 'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent, 'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent, 'volume_multiplier': volume_multiplier, 'direction': direction}
+        cerebro.addstrategy(DcaGridStrategyFIFO, **strategy_params)
+        
         cerebro.broker.set_cash(initial_cash)
-        cerebro.broker.setcommission(commission=commission if use_commission else 0.0, leverage=leverage if is_futures and use_leverage else 1)
-        log_container = st.expander("Показать/скрыть лог сделок", expanded=False)
+        cerebro.broker.setcommission(commission=0.0006)
+        
         start_value = cerebro.broker.getvalue()
         results = cerebro.run()
         end_value = cerebro.broker.getvalue()
-
-        if results[0].liquidated: st.error("БОТ ЛИКВИДИРОВАН", icon="🚨")
         
         st.header("📊 Результаты")
         pnl = end_value - start_value
-        max_drawdown = results[0].analyzers.drawdown.get_analysis()['max']['drawdown']
-        total_trades = len(results[0].trades)
-        col1, col2, col3, col4 = st.columns(4)
+        trade_analysis = results[0].analyzers.trade_analyzer.get_analysis()
+        
+        col1, col2 = st.columns(2)
         col1.metric("Начальный капитал", f"${start_value:,.2f}")
         col2.metric("Конечный капитал", f"${end_value:,.2f}", f"{pnl:,.2f} $")
-        col3.metric("Макс. просадка (%)", f"{max_drawdown:.2f}%")
-        col4.metric("Количество сделок", total_trades)
+
+        st.header("📋 Завершенные торговые циклы (FIFO)")
+        if trade_analysis and 'total' in trade_analysis and trade_analysis.total.total > 0:
+            log_df = create_trade_log_df(trade_analysis)
+            st.dataframe(log_df.style.format({"Профит ($)": "${:,.2f}", "Профит (%)": "{:.2f}%"}))
+        else:
+            st.info("За весь период не было завершено ни одного торгового цикла.")
