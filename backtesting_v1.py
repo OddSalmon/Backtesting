@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 # --- 1. Новый, быстрый движок для бэктеста ---
 def run_fast_backtest(data, params):
-    # Извлекаем параметры для удобства
+    # Извлекаем параметры
     direction = params['direction']
     initial_order_size = params['initial_order_size']
     safety_order_size = params['safety_order_size']
@@ -22,7 +22,7 @@ def run_fast_backtest(data, params):
     
     # Симуляция по дням
     for index, row in data.iterrows():
-        day_low, day_high = row['low'], row['high']
+        day_low, day_high, current_close = row['low'], row['high'], row['close']
 
         # --- Логика Take Profit (FIFO) ---
         if open_orders:
@@ -43,12 +43,12 @@ def run_fast_backtest(data, params):
                     open_orders.pop(0)
         
         # --- Логика входа и страховочных ордеров ---
-        if not open_orders: # Если нет открытых позиций, делаем начальный ордер
-            entry_price = row['open'] # Входим по цене открытия дня
+        if not open_orders:
+            entry_price = row['open']
             size_coin = initial_order_size / entry_price
             open_orders.append({'price': entry_price, 'size_coin': size_coin, 'size_usd': initial_order_size, 'so_level': 0})
             cash -= initial_order_size
-        else: # Если уже есть позиция, проверяем страховочные ордера
+        else:
             if len(open_orders) <= safety_orders_count:
                 last_order_price = open_orders[-1]['price']
                 current_so_level = open_orders[-1]['so_level']
@@ -69,11 +69,34 @@ def run_fast_backtest(data, params):
                         open_orders.append({'price': so_price, 'size_coin': so_size_coin, 'size_usd': so_size_usd, 'so_level': current_so_level + 1})
                         cash -= so_size_usd
 
-    # Рассчитываем итоговую стоимость открытых позиций
-    final_open_positions_value = sum([order['size_coin'] * data['close'][-1] for order in open_orders])
+    # --- ИЗМЕНЕНИЕ: Собираем финальную статистику по "застрявшим" ордерам ---
+    final_open_positions_value = 0
+    total_open_size_coin = 0
+    total_open_cost_usd = 0
+    next_tp_price = 0
+
+    if open_orders:
+        for order in open_orders:
+            total_open_size_coin += order['size_coin']
+            total_open_cost_usd += order['size_usd']
+        
+        final_open_positions_value = total_open_size_coin * data['close'][-1]
+        
+        oldest_order = open_orders[0]
+        if direction == 'Long':
+            next_tp_price = oldest_order['price'] * (1 + take_profit_percent)
+        else:
+            next_tp_price = oldest_order['price'] * (1 - take_profit_percent)
+
     final_cash = cash + final_open_positions_value
+    final_state = {
+        'open_orders_count': len(open_orders),
+        'position_value': final_open_positions_value,
+        'avg_price': (total_open_cost_usd / total_open_size_coin) if total_open_size_coin > 0 else 0,
+        'next_tp_price': next_tp_price
+    }
     
-    return final_cash, completed_cycles
+    return final_cash, completed_cycles, final_state
 
 
 # --- 2. Функции и UI ---
@@ -102,40 +125,46 @@ with st.sidebar:
     st.header("🛠️ Параметры стратегии")
     initial_order_size = st.number_input("Начальный ордер ($)", value=100.0)
     safety_order_size = st.number_input("Страховочный ордер ($)", value=100.0)
-    volume_multiplier = st.number_input("Множитель суммы", min_value=1.0, value=1.0, format="%.2f")
-    safety_orders_count = st.number_input("Макс. кол-во СО", min_value=1, value=20)
-    price_step_percent = st.number_input("Шаг цены (%)", min_value=0.01, value=2.0, format="%.2f")
-    price_step_multiplier = st.number_input("Множитель шага цены", min_value=1.0, value=1.1, format="%.2f")
-    take_profit_percent = st.number_input("Take profit (%)", min_value=0.01, value=1.0, format="%.2f")
+    volume_multiplier = st.number_input("Множитель суммы", min_value=1.0, value=1.03, format="%.2f")
+    safety_orders_count = st.number_input("Макс. кол-во СО", min_value=1, value=100)
+    price_step_percent = st.number_input("Шаг цены (%)", min_value=0.01, value=0.1, format="%.2f")
+    price_step_multiplier = st.number_input("Множитель шага цены", min_value=1.0, value=1.01, format="%.2f")
+    take_profit_percent = st.number_input("Take profit (%)", min_value=0.01, value=0.5, format="%.2f")
 
 if st.sidebar.button("🚀 Запустить бэктест"):
     start_datetime = datetime.combine(start_date, datetime.min.time())
     end_datetime = datetime.combine(end_date, datetime.max.time())
     
-    params = {
-        'direction': direction, 'initial_cash': initial_cash, 'initial_order_size': initial_order_size,
-        'safety_order_size': safety_order_size, 'volume_multiplier': volume_multiplier,
-        'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent,
-        'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent,
-    }
+    params = { 'direction': direction, 'initial_cash': initial_cash, 'initial_order_size': initial_order_size, 'safety_order_size': safety_order_size, 'volume_multiplier': volume_multiplier, 'safety_orders_count': safety_orders_count, 'price_step_percent': price_step_percent, 'price_step_multiplier': price_step_multiplier, 'take_profit_percent': take_profit_percent, }
 
     with st.spinner(f"Загружаем дневные данные для {symbol_ccxt} с {exchange}..."):
-        # Всегда загружаем дневные свечи для скорости
         data_df = fetch_data(exchange, symbol_ccxt, '1d', start_datetime)
 
     if data_df is not None and not data_df.empty:
         data_df = data_df.loc[start_datetime:end_datetime]
         st.success(f"Данные с {start_datetime.date()} по {end_datetime.date()} загружены.")
         
-        final_cash, completed_cycles = run_fast_backtest(data_df, params)
+        final_cash, completed_cycles, final_state = run_fast_backtest(data_df, params)
         
-        st.header(f"📊 Результаты для {symbol_ccxt} ({exchange})")
+        st.header(f"📊 Результаты для {symbol_ccxt}")
         pnl = final_cash - initial_cash
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Начальный капитал", f"${initial_cash:,.2f}")
         col2.metric("Конечный капитал", f"${final_cash:,.2f}", f"{pnl:,.2f} $")
         col3.metric("Завершено циклов", len(completed_cycles))
+
+        # --- ИЗМЕНЕНИЕ: Новый блок с итоговым состоянием бота ---
+        st.header("🏁 Итоговое состояние бота")
+        if final_state['open_orders_count'] > 0:
+            st.warning(f"Бот застрял в позиции к концу периода.", icon="⚠️")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Открыто ордеров", f"{final_state['open_orders_count']} шт.")
+            col2.metric("Стоимость позиции ($)", f"${final_state['position_value']:,.2f}")
+            col3.metric("Средняя цена входа ($)", f"${final_state['avg_price']:,.2f}")
+            col4.metric("Цена для след. TP ($)", f"${final_state['next_tp_price']:,.2f}")
+        else:
+            st.success("Все циклы успешно завершены, открытых позиций нет.", icon="✅")
 
         st.header("📋 Завершенные торговые циклы (FIFO)")
         if completed_cycles:
